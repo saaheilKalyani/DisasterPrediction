@@ -1,195 +1,199 @@
-#!/usr/bin/env python3
+# src/predict.py
 """
-src/predict.py
+Prediction backend for Multi-Disaster system.
 
-Predict disaster likelihood for flood, cyclone, and earthquake
---------------------------------------------------------------
-Loads trained models and test data, computes likelihood scores (0–100),
-classifies as Low/Medium/High, and saves predictions.
-
-Usage:
-    python src/predict.py --disaster flood --model random_forest --save
+Functions:
+ - load_model_for_disaster(disaster) -> sklearn model (loaded from models/{disaster}/*.pkl)
+ - predict_dataframe(df, disaster) -> pandas.DataFrame with predictions, score, risk_level
+ - predict_csvfileobj(fileobj, disaster) -> wrapper that reads CSV from file-like object
 """
 
-import argparse
 import os
-import sys
-import joblib
-import pandas as pd
+import pickle
+import glob
 import numpy as np
-from datetime import datetime
-from sklearn.preprocessing import MinMaxScaler
-from scipy.special import expit
+import pandas as pd
+from typing import Tuple
 
-# === Directories ===
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-PREDICTIONS_DIR = os.path.join(BASE_DIR, "data", "predictions")
-
-# === Utility ===
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-    return path
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def load_model(disaster, model_name):
-    model_path = os.path.join(MODELS_DIR, disaster, f"{model_name}.pkl")
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
-    return joblib.load(model_path)
+def _find_first_pkl_in_folder(folder_path: str) -> str | None:
+    pkl_glob = os.path.join(folder_path, "*.pkl")
+    matches = glob.glob(pkl_glob)
+    if not matches:
+        return None
+    return matches[0]
 
 
-def load_scaler(disaster):
-    scaler_path = os.path.join(PROCESSED_DIR, disaster, "scaler.joblib")
-    if os.path.isfile(scaler_path):
-        return joblib.load(scaler_path)
+def load_model_for_disaster(disaster: str):
+    """
+    Load the first .pkl model found in models/{disaster}/
+    Raises FileNotFoundError if no model found.
+    """
+    models_dir = os.path.join(ROOT, "models", disaster.lower())
+    print(f"[predict] Looking for models in: {models_dir}")
+    if not os.path.isdir(models_dir):
+        raise FileNotFoundError(f"No models directory for disaster '{disaster}' at {models_dir}")
+
+    pkl_path = _find_first_pkl_in_folder(models_dir)
+    if pkl_path is None:
+        raise FileNotFoundError(f"No .pkl model found in {models_dir}")
+
+    print(f"[predict] Loading model: {pkl_path}")
+    with open(pkl_path, "rb") as f:
+        model = pickle.load(f)
+    print(f"[predict] Model loaded successfully.")
+    return model
+
+
+def _get_model_feature_names(model) -> list | None:
+    """
+    Try to obtain feature names from model (sklearn's feature_names_in_).
+    Return None if not available.
+    """
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+    # Some pipelines keep it inside named_steps['preprocessor'] etc, but we keep
+    # simple: no inference if attribute not present
     return None
 
 
-def load_input(disaster, input_csv=None):
-    """Load custom input CSV or test dataset."""
-    if input_csv:
-        if not os.path.isfile(input_csv):
-            raise FileNotFoundError(f"Input CSV not found: {input_csv}")
-        return pd.read_csv(input_csv)
-
-    # Try common processed test files
-    candidates = [
-        os.path.join(PROCESSED_DIR, disaster, "test.csv"),
-        os.path.join(PROCESSED_DIR, disaster, "labeled_processed.csv"),
-        os.path.join(PROCESSED_DIR, disaster, "full_processed.csv"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return pd.read_csv(c)
-
-    raise FileNotFoundError(
-        f"No test file found for {disaster}. Provide --input_csv manually."
-    )
+def _ensure_columns(df: pd.DataFrame, required_cols: list) -> Tuple[pd.DataFrame, list]:
+    """
+    Ensure df has required_cols. If missing, add them filled with 0.
+    Return (new_df, filled_columns_list)
+    """
+    filled = []
+    for c in required_cols:
+        if c not in df.columns:
+            df[c] = 0
+            filled.append(c)
+    # Reorder to required_cols + any other columns (so model get expected order)
+    ordered = df.reindex(columns=required_cols + [c for c in df.columns if c not in required_cols])
+    return ordered, filled
 
 
-def get_features(df):
-    exclude = {"target", "label", "risk", "disaster", "id"}
-    features = [c for c in df.columns if c.lower() not in exclude]
-    if not features:
-        raise ValueError("No valid feature columns found.")
-    return features
+def _score_from_model(model, X: pd.DataFrame) -> np.ndarray:
+    """
+    Produce a 0-100 likelihood score per row.
+    Prefer predict_proba, then decision_function, then fallback.
+    """
+    # 1) predict_proba
+    if hasattr(model, "predict_proba"):
+        try:
+            probs = model.predict_proba(X)
+            # If binary, take probability of positive class (class index 1 if exists)
+            if probs.shape[1] == 1:
+                # edge-case
+                score = (probs.ravel() * 100).astype(float)
+            else:
+                # take max probability across classes as confidence
+                score = (probs.max(axis=1) * 100).astype(float)
+            return score
+        except Exception as e:
+            print(f"[predict] Warning: predict_proba failed with: {e}")
 
+    # 2) decision_function -> scale to 0-100
+    if hasattr(model, "decision_function"):
+        try:
+            dfv = model.decision_function(X)
+            # dfv may be 1d or 2d
+            if dfv.ndim == 1:
+                vals = dfv
+            else:
+                # take maximum absolute score across classes
+                vals = np.max(np.abs(dfv), axis=1)
+            # scale to 0-100 using min-max (avoid division by zero)
+            mi, ma = np.min(vals), np.max(vals)
+            if ma - mi < 1e-9:
+                return np.full(vals.shape, 50.0)
+            scaled = (vals - mi) / (ma - mi) * 100.0
+            return scaled.astype(float)
+        except Exception as e:
+            print(f"[predict] Warning: decision_function failed with: {e}")
 
-def compute_score(prob):
-    """Convert probability to 0–100 integer."""
+    # 3) fallback: use predict (discrete) -> map to 90 (predicted positive) / 10 (predicted negative)
     try:
-        score = int(round(float(prob) * 100))
-        return max(0, min(score, 100))
-    except Exception:
-        return 0
+        preds = model.predict(X)
+        # if binary with labels like [0,1] or [-1,1], treat non-zero as positive
+        score = np.where(np.array(preds) != 0, 90.0, 10.0).astype(float)
+        return score
+    except Exception as e:
+        print(f"[predict] Error: fallback predict failed too: {e}")
+        # final fallback: neutral 50
+        return np.full((X.shape[0],), 50.0)
 
 
-def classify(score):
-    """Categorize into Low/Medium/High risk."""
-    if score < 40:
+def _risk_from_score(score: float) -> str:
+    """
+    Convert numeric score into Low / Moderate / High
+    Thresholds:
+      0 - 33 -> Low
+      34 - 66 -> Moderate
+      67 -100 -> High
+    """
+    if score <= 33:
         return "Low"
-    elif score < 70:
-        return "Medium"
+    elif score <= 66:
+        return "Moderate"
     else:
         return "High"
 
 
-# === Core Prediction ===
-def predict_for_df(df, disaster, model_name="random_forest"):
-    model = load_model(disaster, model_name)
-    scaler = load_scaler(disaster)
-    features = get_features(df)
+def predict_dataframe(df: pd.DataFrame, disaster: str) -> pd.DataFrame:
+    """
+    Given a dataframe (row(s) of feature columns), and disaster name,
+    return a dataframe with added columns:
+      - Predicted_Label
+      - Disaster_Likelihood_Score  (0-100 float)
+      - Risk_Level (Low/Moderate/High)
+    The model may expect specific features. We'll try to align using model.feature_names_in_ if available.
+    """
+    if df is None or df.shape[0] == 0:
+        raise ValueError("Empty dataframe provided for prediction")
 
-    X = df[features].copy()
-    if X.isnull().any().any():
-        X = X.fillna(X.median(numeric_only=True))
+    model = load_model_for_disaster(disaster)
+    feature_names = _get_model_feature_names(model)
+    X = df.copy()
 
-    # Scale input
-    if scaler:
-        try:
-            X_scaled = scaler.transform(X)
-        except Exception:
-            X_scaled = MinMaxScaler().fit_transform(X)
+    if feature_names:
+        print(f"[predict] Model expects features: {feature_names}")
+        X_aligned, filled = _ensure_columns(X, feature_names)
+        if filled:
+            print(f"[predict] Filled missing columns with 0: {filled}")
+        X_for_model = X_aligned[feature_names]
     else:
-        X_scaled = MinMaxScaler().fit_transform(X)
+        # No declared feature names: attempt to use all columns in df
+        print("[predict] Model has no feature_names_in_. Using columns from uploaded CSV.")
+        X_for_model = X
 
-    # === Predict probabilities safely ===
+    # Attempt numeric conversion
+    X_for_model = X_for_model.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    # Get predicted label if possible
     try:
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X_scaled)
-            if proba.shape[1] == 2:
-                probs = proba[:, 1]
-            else:
-                probs = proba.max(axis=1)
-        elif hasattr(model, "decision_function"):
-            df_val = model.decision_function(X_scaled)
-            probs = expit(df_val)  # sigmoid normalization
-        else:
-            preds = model.predict(X_scaled)
-            probs = preds.astype(float)
+        preds = model.predict(X_for_model)
+        print(f"[predict] Raw predictions: {preds[:5]}{'...' if len(preds) > 5 else ''}")
     except Exception as e:
-        print(f"[WARN] Probability extraction failed: {e}")
-        preds = model.predict(X_scaled)
-        probs = preds.astype(float)
+        print(f"[predict] Warning: model.predict failed: {e}")
+        preds = np.array([None] * X_for_model.shape[0])
 
-    # Ensure vector lengths match
-    preds = model.predict(X_scaled)
-    if len(probs) != len(X):
-        probs = np.zeros(len(X))
+    # Get score
+    scores = _score_from_model(model, X_for_model)
+    risk_levels = [_risk_from_score(float(s)) for s in scores]
 
-    scores = [compute_score(p) for p in probs]
-    risk = [classify(s) for s in scores]
+    out = df.copy().reset_index(drop=True)
+    out["Predicted_Label"] = preds
+    out["Disaster_Likelihood_Score"] = scores.round(2)
+    out["Risk_Level"] = risk_levels
 
-    result = df.copy().reset_index(drop=True)
-    result["predicted_label"] = preds
-    result["likelihood_score"] = scores
-    result["risk_level"] = risk
-    result["model_used"] = model_name
-    result["disaster_type"] = disaster
-    return result
+    return out
 
 
-def save_results(df, disaster):
-    out_dir = ensure_dir(os.path.join(PREDICTIONS_DIR, disaster))
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(out_dir, f"predictions_{ts}.csv")
-    df.to_csv(path, index=False)
-    return path
-
-
-# === CLI ===
-def main():
-    parser = argparse.ArgumentParser(description="Predict disaster likelihood")
-    parser.add_argument("--disaster", required=True, choices=["flood", "cyclone", "earthquake"])
-    parser.add_argument("--model", default="random_forest")
-    parser.add_argument("--input_csv", default=None)
-    parser.add_argument("--save", action="store_true")
-    args = parser.parse_args()
-
-    try:
-        df = load_input(args.disaster, args.input_csv)
-    except Exception as e:
-        print(f"❌ Failed to load data: {e}")
-        sys.exit(1)
-
-    try:
-        results = predict_for_df(df, args.disaster, args.model)
-    except Exception as e:
-        print(f"❌ Prediction failed: {e}")
-        sys.exit(2)
-
-    print(f"\n✅ Predictions generated for {args.disaster}")
-    print(f"Rows: {len(results)} | Score range: {results['likelihood_score'].min()} - {results['likelihood_score'].max()}")
-    print(results[["likelihood_score", "risk_level"]].head())
-
-    if args.save:
-        out_path = save_results(results, args.disaster)
-        print(f"💾 Saved predictions to: {out_path}")
-    else:
-        print("To save results, re-run with --save")
-
-
-if __name__ == "__main__":
-    main()
+def predict_csvfileobj(fileobj, disaster: str) -> pd.DataFrame:
+    """
+    Reads CSV from a file-like object (BytesIO / uploaded file), predicts, returns df.
+    """
+    df = pd.read_csv(fileobj)
+    return predict_dataframe(df, disaster)

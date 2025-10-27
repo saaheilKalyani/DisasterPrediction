@@ -1,0 +1,4 @@
+wind_speed,pressure,humidity,temperature,sea_surface_temp,lat,lon
+50,980,85,28.5,29.1,15.2,72.4
+10,1012,70,26.2,27.0,18.9,74.0
+120,950,92,30.3,30.5,14.0,71.5
